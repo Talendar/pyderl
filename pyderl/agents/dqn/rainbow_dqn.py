@@ -2,17 +2,22 @@
 TODO
 """
 
+import os
 import pathlib
+from collections import deque
 from datetime import datetime
-from typing import List, Optional, Union
+from timeit import default_timer as timer
+from typing import Any, List, Optional, Union, Tuple
 
 import gym
 import numpy as np
 import tensorflow as tf
+from PIL import Image
 
 from pyderl.agents.base_agent import BaseAgent
 from pyderl.agents.dqn.prioritized_replay_buffer import PrioritizedReplayBuffer
 from pyderl.utils import LinearInterpolator
+from pyderl.utils import compute_eta
 
 
 class RainbowDQNAgent(BaseAgent):
@@ -21,7 +26,7 @@ class RainbowDQNAgent(BaseAgent):
     .. todo::
         [X] Double Deep Q Learning
         [X] Prioritized Experience Replay
-        [ ] Dueling DQN Architecture
+        [X] Dueling DQN Architecture
         [ ] A3C
         [ ] Distributional Q Learning
         [ ] Noisy DQN
@@ -41,30 +46,146 @@ class RainbowDQNAgent(BaseAgent):
     """
 
     def __init__(self,
-                 network: tf.keras.Model,
                  num_actions: int,
+                 input_shape: Tuple[int, ...],
+                 batch_size: int = 32,
+                 model: Optional[tf.keras.Model] = None,
+                 input_stream_layers: Optional[
+                     List[tf.keras.layers.Layer]] = None,
+                 build_dueling: bool = True,
+                 state_stream_hidden_units: Union[int, List[int]] = 256,
+                 adv_stream_hidden_units: Union[int, List[int]] = 256,
                  gamma: float = 0.99,
                  learning_rate: float = 5e-4,
                  replay_buffer_size: int = 100000,
                  prioritized_replay_alpha: float = 0.6,
                  prioritized_replay_epsilon: float = 1e-6) -> None:
+        self._input_shape = input_shape
+        self._batch_size = batch_size
         self._num_actions = num_actions
         self._gamma = gamma
-
-        self.prioritized_replay_alpha = prioritized_replay_alpha
         self.prioritized_replay_epsilon = prioritized_replay_epsilon
+        input_tensor = tf.keras.layers.Input(shape=input_shape,
+                                             batch_size=batch_size)
+
+        # Building dueling network:
+        if build_dueling:
+            # Assertions
+            if input_stream_layers is None:
+                raise ValueError("The layers of the input stream must be "
+                                 "specified in order for the dueling network "
+                                 "to be built!")
+            if model is not None:
+                raise ValueError("A model shouldn't be passed as argument when "
+                                 "`build_dueling` is set to `True`!")
+
+            # Converting int to list:
+            if type(state_stream_hidden_units) == int:
+                state_stream_hidden_units = [state_stream_hidden_units]
+
+            if type(adv_stream_hidden_units) == int:
+                adv_stream_hidden_units = [adv_stream_hidden_units]
+
+            # Building the network:
+            model = RainbowDQNAgent.build_dueling_architecture(
+                inputs=input_tensor,
+                num_actions=num_actions,
+                input_stream_layers=input_stream_layers,
+                state_stream_hidden_units=state_stream_hidden_units,
+                adv_stream_hidden_units=adv_stream_hidden_units,
+            )
+        # Assertions
+        else:
+            if input_stream_layers is not None:
+                raise ValueError("An input stream should be only passed as "
+                                 "argument when `build_dueling` is set to"
+                                 "`True`!")
+            if model is None:
+                raise ValueError("A full model must be specified when "
+                                 "`build_dueling` is set to `False`!")
+
+        # Building replay buffer:
         self.replay_buffer = PrioritizedReplayBuffer(
             size=replay_buffer_size,
             alpha=prioritized_replay_alpha,
         )
 
-        self.online_model = network
+        # Online and target networks:
+        self.online_model = model
+        self.online_model(input_tensor)
+
         self.target_model = tf.keras.models.clone_model(self.online_model)
         self.update_target_network()
 
+        # Building optimizer:
         self.optimizer = tf.optimizers.Adam(learning_rate=learning_rate,
                                             clipnorm=1.0)
+
+        # Loss function:
         self.loss = tf.keras.losses.Huber()
+
+    @staticmethod
+    def build_dueling_architecture(inputs: Any,
+                                   num_actions: int,
+                                   input_stream_layers: List[
+                                       tf.keras.layers.Layer],
+                                   state_stream_hidden_units: List[int],
+                                   adv_stream_hidden_units: List[int],
+    ) -> tf.keras.Model:
+        """ TODO
+
+        Args:
+            inputs:
+            num_actions:
+            input_stream_layers:
+            state_stream_hidden_units:
+            adv_stream_hidden_units:
+
+        Returns:
+
+        """
+        # Main layers:
+        input_stream_out = inputs
+        for layer in input_stream_layers:
+            input_stream_out = layer(input_stream_out)
+
+        # State value:
+        state_value = input_stream_out
+        for n, units in enumerate(state_stream_hidden_units):
+            state_value = tf.keras.layers.Dense(
+                units=units, activation="relu", name=f"state_dense{n}",
+            )(state_value)
+        state_value = tf.keras.layers.Dense(units=1,
+                                            activation="linear",
+                                            name="state_value")(state_value)
+
+        # Advantages:
+        advantages = input_stream_out
+        for n, units in enumerate(adv_stream_hidden_units):
+            advantages = tf.keras.layers.Dense(
+                units=units, activation="relu", name=f"adv_dense{n}",
+            )(advantages)
+        advantages = tf.keras.layers.Dense(units=num_actions,
+                                           activation="linear",
+                                           name="advantages_raw")(advantages)
+        advantages = tf.keras.layers.Lambda(
+            lambda a: a - tf.reduce_mean(a, axis=1, keepdims=True),
+            name="advantages_mean_sub",
+        )(advantages)
+
+        # Output:
+        q_out = tf.keras.layers.Add(name="q_values")([state_value, advantages])
+
+        return tf.keras.Model(inputs=inputs, outputs=q_out)
+
+    def visualize(self) -> None:
+        temp_file_name = ".temp_model_img.png"
+        tf.keras.utils.plot_model(self.online_model,
+                                  to_file=temp_file_name,
+                                  show_shapes=True)
+
+        Image.open(temp_file_name).show()
+        os.remove(temp_file_name)
 
     def act(self,
             obs: Union[np.ndarray, tf.Tensor],
@@ -150,10 +271,9 @@ class RainbowDQNAgent(BaseAgent):
     def train(self,
               env: gym.Env,
               total_timesteps: int = 100000,
-              exploration_fraction: float = 0.3,
-              min_exploration_chance: float = 0.05,
+              exploration_fraction: float = 0.2,
+              min_exploration_chance: float = 0.02,
               train_freq: int = 4,
-              batch_size: int = 32,
               learning_starts_step: int = 1000,
               target_network_update_freq: int = 500,
               prioritized_replay_beta0: float = 0.4,
@@ -174,8 +294,6 @@ class RainbowDQNAgent(BaseAgent):
             min_exploration_chance (float): Final value of the exploration rate.
             train_freq (int): A training session, in which the model's
                 parameters are updated, is performed every `train_freq` steps.
-            batch_size (int): Size of the batch sampled from the replay buffer
-                during a training session.
             learning_starts_step (int): Amount of steps to wait before starting
                 regular training sessions. During this period, the agent is only
                 collecting transitions from the environment.
@@ -225,9 +343,15 @@ class RainbowDQNAgent(BaseAgent):
         # Storage for the total rewards obtained in each episode:
         episodes_rewards = [0.0]
 
+        # Storage for the time taken to perform the last n steps:
+        steps_times = deque(maxlen=2000)
+
         # Training:
         obs = env.reset()
         for t in range(total_timesteps):
+            # Starting timer:
+            step_start_time = timer()
+
             # Rendering env:
             if render_env:
                 env.render()
@@ -245,16 +369,25 @@ class RainbowDQNAgent(BaseAgent):
             if done:
                 # Printing info:
                 if verbose:
-                    # TODO: ETA based on avg time per step
                     avg_reward = np.mean(episodes_rewards
-                                         if len(episodes_rewards) <= 50
-                                         else episodes_rewards[-50:])
+                                         if len(episodes_rewards) <= 100
+                                         else episodes_rewards[-100:])
+                    avg_time_per_step = np.mean(steps_times)
+                    eta = compute_eta(avg_time_per_step=avg_time_per_step,
+                                      remaining_steps=(total_timesteps - t))
+                    pc_completed = (t + 1) / total_timesteps
+
                     print(
-                        f"[Episode {len(episodes_rewards)}]"
-                        f"[Timestep {t + 1}/{total_timesteps}] "
-                        f"Reward: {episodes_rewards[-1]}  |  "
-                        f"Avg. reward (50 past episodes): {avg_reward:.2f}  |  "
+                        f"[{pc_completed:.2%}]"
+                        f"[E: {len(episodes_rewards)}]"
+                        f"[T: {t + 1}/{total_timesteps}] "
+                        f"Reward: {episodes_rewards[-1]}"
+                        f"  |  "
+                        f"Avg. reward (100 past episodes): {avg_reward:.2f}"
+                        f"  |  "
                         f"Exploration chance: {exploration_chance.value(t):.2%}"
+                        f"\nETA: {eta}  |  "
+                        f"Avg. time per step: {1e3 * avg_time_per_step:.2f}ms\n"
                     )
 
                 # Resetting:
@@ -263,8 +396,10 @@ class RainbowDQNAgent(BaseAgent):
 
             # Experience replay:
             if t >= learning_starts_step and (t % train_freq) == 0:
-                experience = self.replay_buffer.sample(batch_size=batch_size,
-                                                       beta=prb_beta.value(t))
+                experience = self.replay_buffer.sample(
+                    batch_size=self._batch_size,
+                    beta=prb_beta.value(t),
+                )
                 self._experience_replay(*experience)
 
             # Updating target network:
@@ -276,5 +411,8 @@ class RainbowDQNAgent(BaseAgent):
             if checkpoint and (t % checkpoint_freq) == 0:
                 # TODO
                 raise NotImplementedError()
+
+            # Storing the amount of time taken to complete the step:
+            steps_times.append(timer() - step_start_time)
 
         return episodes_rewards

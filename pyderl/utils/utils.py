@@ -29,3 +29,12 @@ def visualize_agent(agent: BaseAgent,
         print(f"Episode reward: {episodes_rewards[-1]}")
 
     print(f"Total reward: {sum(episodes_rewards)}")
+
+
+def compute_eta(avg_time_per_step: float,
+                remaining_steps: int) -> str:
+    """ todo """
+    remaining_time = int(avg_time_per_step * remaining_steps)
+    m, s = divmod(remaining_time, 60)
+    h, m = divmod(m, 60)
+    return f"{h:d}:{m:02d}:{s:02d}"
